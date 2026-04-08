@@ -160,6 +160,15 @@ edit scripts/install-openab-gemini.sh   # set DISCORD_BOT_TOKEN, DISCORD_CHANNEL
 sudo ./scripts/install-openab-gemini.sh
 ```
 
+You can also pass the values as environment variables instead of editing the script:
+
+```bash
+DISCORD_BOT_TOKEN=... \
+DISCORD_CHANNEL_ID=... \
+GEMINI_API_KEY=... \
+sudo -E ./scripts/install-openab-gemini.sh
+```
+
 Then verify the service:
 
 ```bash

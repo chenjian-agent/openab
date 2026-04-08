@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DISCORD_BOT_TOKEN="replace_with_your_discord_bot_token"
-DISCORD_CHANNEL_ID="replace_with_your_discord_channel_id"
-GEMINI_API_KEY="replace_with_your_gemini_api_key"
+DISCORD_BOT_TOKEN="${DISCORD_BOT_TOKEN:-replace_with_your_discord_bot_token}"
+DISCORD_CHANNEL_ID="${DISCORD_CHANNEL_ID:-replace_with_your_discord_channel_id}"
+GEMINI_API_KEY="${GEMINI_API_KEY:-replace_with_your_gemini_api_key}"
 
 APP_USER="openab"
 APP_GROUP="openab"
