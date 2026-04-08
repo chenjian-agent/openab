@@ -23,7 +23,10 @@ data:
     args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
     working_dir = "{{ $cfg.workingDir | default "/home/agent" }}"
     {{- if $cfg.env }}
-    env = { {{ range $k, $v := $cfg.env }}{{ $k }} = "{{ $v }}", {{ end }} }
+    [agent.env]
+    {{- range $k, $v := $cfg.env }}
+    {{ $k }} = "{{ $v }}"
+    {{- end }}
     {{- end }}
 
     [pool]
