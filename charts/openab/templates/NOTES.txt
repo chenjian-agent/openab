@@ -23,6 +23,13 @@ Agents deployed:
 {{- else if eq $cfg.command "gemini" }}
     Authenticate:
     kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- gemini
+{{- else if eq $cfg.command "qwen" }}
+    Authenticate:
+    kubectl exec -it deployment/{{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} -- qwen auth
+    Or set an API key:
+    helm upgrade {{ $.Release.Name }} openab/openab --set agents.{{ $name }}.env.OPENAI_API_KEY="${OPENAI_API_KEY}"
+{{- else }}
+    Authenticate your agent CLI — refer to its documentation.
 {{- end }}
 
     Restart after auth:

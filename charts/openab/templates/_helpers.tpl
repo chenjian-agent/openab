@@ -36,6 +36,7 @@ app.kubernetes.io/instance: {{ .ctx.Release.Name }}
 app.kubernetes.io/component: {{ .agent }}
 {{- end }}
 
+<<<<<<< HEAD
 {{/* Per-agent resource name: <fullname>-<agentKey> */}}
 {{- define "openab.agentFullname" -}}
 {{- printf "%s-%s" (include "openab.fullname" .ctx) .agent | trunc 63 | trimSuffix "-" }}

@@ -18,16 +18,21 @@ containerSecurityContext:
 agents:
   kiro:
     # To add a second agent, uncomment and fill in the block below:
-    # claude:
-    #   command: claude-agent-acp
-    #   args: []
+    # qwen:
+    #   image:
+    #     repository: ghcr.io/openabdev/openab-qwen
+    #     tag: "78f8d2c"
+    #   command: qwen
+    #   args:
+    #     - --acp
     #   discord:
     #     botToken: ""
     #     # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
     #     allowedChannels:
     #       - "YOUR_CHANNEL_ID"
-    #   workingDir: /home/agent
-    #   env: {}
+    #   workingDir: /home/node
+    #   env:
+    #     OPENAI_API_KEY: "${OPENAI_API_KEY}"
     #   envFrom: []
     #   pool:
     #     maxSessions: 10

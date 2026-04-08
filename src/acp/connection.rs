@@ -90,13 +90,16 @@ impl AcpConnection {
                     // Auto-reply session/request_permission
                     if msg.method.as_deref() == Some("session/request_permission") {
                         if let Some(id) = msg.id {
-                            let title = msg.params.as_ref()
+                            let title = msg
+                                .params
+                                .as_ref()
                                 .and_then(|p| p.get("toolCall"))
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
                             info!(title, "auto-allow permission");
-                            let reply = JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
+                            let reply =
+                                JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;
@@ -214,7 +217,9 @@ impl AcpConnection {
             )
             .await?;
 
-        let agent_name = resp.result.as_ref()
+        let agent_name = resp
+            .result
+            .as_ref()
             .and_then(|r| r.get("agentInfo"))
             .and_then(|a| a.get("name"))
             .and_then(|n| n.as_str())
@@ -225,13 +230,12 @@ impl AcpConnection {
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
         let resp = self
-            .send_request(
-                "session/new",
-                Some(json!({"cwd": cwd, "mcpServers": []})),
-            )
+            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
             .await?;
 
-        let session_id = resp.result.as_ref()
+        let session_id = resp
+            .result
+            .as_ref()
             .and_then(|r| r.get("sessionId"))
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow!("no sessionId in session/new response"))?
@@ -284,5 +288,47 @@ impl AcpConnection {
 
     pub fn alive(&self) -> bool {
         !self._reader_handle.is_finished()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AcpConnection;
+    use anyhow::Result;
+    use std::collections::HashMap;
+    use std::process::Command;
+
+    fn qwen_available() -> bool {
+        Command::new("qwen")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn qwen_acp_smoke_test() -> Result<()> {
+        if !qwen_available() {
+            eprintln!("skipping qwen_acp_smoke_test: qwen is not installed");
+            return Ok(());
+        }
+
+        let mut conn =
+            AcpConnection::spawn("qwen", &["--acp".to_string()], ".", &HashMap::new()).await?;
+
+        conn.initialize().await?;
+
+        match conn.session_new(".").await {
+            Ok(session_id) => assert!(!session_id.is_empty(), "session id should not be empty"),
+            Err(err) => {
+                let err_text = err.to_string();
+                assert!(
+                    err_text.contains("Authentication required"),
+                    "unexpected session/new error: {err_text}"
+                );
+            }
+        }
+
+        Ok(())
     }
 }

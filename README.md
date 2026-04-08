@@ -15,7 +15,7 @@ A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Ag
 
 ## Features
 
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini via config
+- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, Qwen Code via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Edit-streaming** — live-updates the Discord message every 1.5s as tokens arrive
@@ -89,6 +89,7 @@ Supports Kiro CLI, Claude Code, Codex, Gemini, and any ACP-compatible CLI.
 | `codex` | Codex | [@zed-industries/codex-acp](https://github.com/zed-industries/codex-acp) | `codex login --device-auth` |
 | `claude` | Claude Code | [@agentclientprotocol/claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) | `claude setup-token` |
 | `gemini` | Gemini CLI | Native `gemini --acp` | Google OAuth or `GEMINI_API_KEY` |
+| `qwen` | Qwen Code | Native `qwen --acp` | `qwen auth` or `OPENAI_API_KEY` |
 
 ### Helm Install (recommended)
 
@@ -102,6 +103,26 @@ helm install openab openab/openab \
   --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
 ```
 
+Qwen Code can be deployed as its own agent entry:
+
+```bash
+helm install openab openab/openab \
+  --set agents.qwen.image.repository=ghcr.io/openabdev/openab-qwen \
+  --set agents.qwen.image.tag=78f8d2c \
+  --set agents.qwen.command=qwen \
+  --set-json 'agents.qwen.args=["--acp"]' \
+  --set agents.qwen.workingDir=/home/node \
+  --set agents.qwen.discord.botToken="$DISCORD_BOT_TOKEN" \
+  --set-string 'agents.qwen.discord.allowedChannels[0]=YOUR_CHANNEL_ID'
+```
+
+Then authenticate inside the pod (first time only):
+
+```bash
+kubectl exec -it deployment/openab-qwen -- qwen auth
+# Or set an API key:
+helm upgrade openab openab/openab --set agents.qwen.env.OPENAI_API_KEY="${OPENAI_API_KEY}"
+```
 ### Manual config.toml
 
 For non-Helm deployments, configure the `[agent]` block per CLI:
@@ -131,6 +152,13 @@ command = "gemini"
 args = ["--acp"]
 working_dir = "/home/agent"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
+
+# Qwen Code
+[agent]
+command = "qwen"
+args = ["--acp"]
+working_dir = "/home/node"
+env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }
 ```
 
 ### VM + systemd (Gemini example)
@@ -191,6 +219,30 @@ Notes:
 - Using `GEMINI_API_KEY` is the simplest VM setup; no interactive OAuth step is required.
 - The script creates an `openab` user and uses `/home/openab` as the runtime working directory.
 - Re-running the script reuses `/tmp/openab-src` and skips reinstalling Gemini CLI if `gemini` is already in `PATH`.
+
+### Local Qwen Code smoke test
+
+Install Qwen Code locally:
+
+```bash
+npm install -g @qwen-code/qwen-code
+qwen --version
+```
+
+Authenticate before sending prompts:
+
+```bash
+qwen auth
+# Or export OPENAI_API_KEY=...
+```
+
+`openab` can spawn `qwen --acp` directly. The repository includes a smoke test that exercises the same ACP bootstrap path used at runtime:
+
+```bash
+cargo test qwen_acp_smoke_test -- --nocapture
+```
+
+Without authentication, `initialize` succeeds and `session/new` fails with Qwen's expected auth error. After `qwen auth` or `OPENAI_API_KEY` is configured, the same test should create a session successfully.
 
 ## Configuration Reference
 
