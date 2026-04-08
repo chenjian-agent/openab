@@ -117,7 +117,7 @@ working_dir = "/home/agent"
 [agent]
 command = "codex-acp"
 args = []
-working_dir = "/home/agent"
+working_dir = "/home/node"
 
 # Claude Code (requires claude-agent-acp in PATH)
 [agent]
@@ -129,7 +129,7 @@ working_dir = "/home/node"
 [agent]
 command = "gemini"
 args = ["--acp"]
-working_dir = "/home/agent"
+working_dir = "/home/node"
 env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 ```
 
