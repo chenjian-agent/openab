@@ -16,6 +16,6 @@ spec:
   {{- end }}
   resources:
     requests:
-      storage: {{ $cfg.persistence.size }}
+      storage: {{ $cfg.persistence.size | default "1Gi" }}
 {{- end }}
 {{- end }}

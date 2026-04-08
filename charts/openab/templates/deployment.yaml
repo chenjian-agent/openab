@@ -31,7 +31,7 @@ spec:
       containers:
         - name: openab
           image: {{ include "openab.agentImage" $d | quote }}
-          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          imagePullPolicy: {{ include "openab.agentImagePullPolicy" $d }}
           {{- with $.Values.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
