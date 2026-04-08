@@ -123,7 +123,7 @@ working_dir = "/home/agent"
 [agent]
 command = "claude-agent-acp"
 args = []
-working_dir = "/home/agent"
+working_dir = "/home/node"
 
 # Gemini
 [agent]
