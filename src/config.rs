@@ -20,6 +20,8 @@ pub struct DiscordConfig {
     pub allowed_channels: Vec<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    #[serde(default = "crate::config::default_true")]
+    pub mention_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +92,7 @@ pub struct ReactionTiming {
 fn default_working_dir() -> String { "/tmp".into() }
 fn default_max_sessions() -> usize { 10 }
 fn default_ttl_hours() -> u64 { 24 }
-fn default_true() -> bool { true }
+pub fn default_true() -> bool { true }
 
 fn emoji_queued() -> String { "👀".into() }
 fn emoji_thinking() -> String { "🤔".into() }

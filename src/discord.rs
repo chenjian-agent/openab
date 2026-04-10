@@ -17,6 +17,7 @@ pub struct Handler {
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
+    pub mention_only: bool,
 }
 
 #[async_trait]
@@ -61,7 +62,7 @@ impl EventHandler for Handler {
         if !in_allowed_channel && !in_thread {
             return;
         }
-        if !in_thread && !is_mentioned {
+        if !in_thread && self.mention_only && !is_mentioned {
             return;
         }
 

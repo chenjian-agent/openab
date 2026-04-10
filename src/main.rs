@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         allowed_channels,
         allowed_users,
         reactions_config: cfg.reactions,
+        mention_only: cfg.discord.mention_only,
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
