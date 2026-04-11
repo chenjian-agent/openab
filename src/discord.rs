@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{error, info};
 
+const THREAD_EXISTS_MSG: &str = "A thread has already been created for this message";
+
 pub struct Handler {
     pub pool: Arc<SessionPool>,
     pub allowed_channels: HashSet<u64>,
@@ -390,9 +392,7 @@ async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> any
 
     match thread {
         Ok(thread) => Ok(thread.id.get()),
-        Err(err) if err.to_string().contains("A thread has already been created for this message") => {
-            Ok(msg.id.get())
-        }
+        Err(err) if err.to_string().contains(THREAD_EXISTS_MSG) => Ok(msg.id.get()),
         Err(err) => Err(err.into()),
     }
 }
