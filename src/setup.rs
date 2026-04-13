@@ -541,10 +541,14 @@ fn section_agent() -> (String, String, bool) {
     let idx = prompt_choice("  Select agent:", &choices);
     let agent = choices[idx];
 
-    let deploy_choices = ["Local (current directory)", "Docker / k8s (/home/agent)"];
+    let deploy_choices = ["Local (current directory)", "Docker / k8s"];
     let deploy_idx = prompt_choice("  Deployment target:", &deploy_choices);
     let is_local = deploy_idx == 0;
-    let default_dir = if is_local { "." } else { "/home/agent" };
+    let default_dir = match (is_local, agent) {
+        (true, _) => ".",
+        (false, "kiro") => "/home/agent",
+        (false, _) => "/home/node",
+    };
 
     let working_dir = prompt_default("  Working directory", default_dir);
 
