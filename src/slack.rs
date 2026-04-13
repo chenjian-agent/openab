@@ -257,12 +257,26 @@ pub async fn run_slack_adapter(
                                     }
                                     "message" => {
                                         // Handle thread follow-ups without @mention.
-                                        // Skip bot messages and subtypes (join/leave/edits).
+                                        // Skip bot messages and subtypes that aren't real user messages.
                                         let has_thread = event["thread_ts"].is_string();
                                         let is_bot = event["bot_id"].is_string()
                                             || event["subtype"].as_str() == Some("bot_message");
-                                        let has_subtype = event["subtype"].is_string();
-                                        if has_thread && !is_bot && !has_subtype {
+                                        let subtype = event["subtype"].as_str().unwrap_or("");
+                                        let has_files = event["files"].is_array();
+                                        debug!(
+                                            has_thread,
+                                            is_bot,
+                                            subtype,
+                                            has_files,
+                                            text = event["text"].as_str().unwrap_or(""),
+                                            "message event received"
+                                        );
+                                        let skip_subtype = matches!(subtype,
+                                            "message_changed" | "message_deleted" |
+                                            "channel_join" | "channel_leave" |
+                                            "channel_topic" | "channel_purpose"
+                                        );
+                                        if has_thread && !is_bot && !skip_subtype {
                                             handle_message(
                                                 event,
                                                 false,
