@@ -42,3 +42,21 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
     }
     chunks
 }
+
+/// Shorten a prompt into a thread title: collapse GitHub URLs and cap at 40 chars.
+pub fn shorten_thread_name(prompt: &str) -> String {
+    use std::sync::LazyLock;
+    static GH_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"https?://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)").unwrap()
+    });
+    // Strip @(role) and @(user) placeholders left by resolve_mentions()
+    let cleaned = prompt.replace("@(role)", "").replace("@(user)", "");
+    let shortened = GH_RE.replace_all(cleaned.trim(), "$1#$3");
+    let name: String = shortened.chars().take(40).collect();
+    if name.len() < shortened.len() {
+        format!("{name}...")
+    } else {
+        name
+    }
+}
+

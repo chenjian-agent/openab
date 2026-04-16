@@ -10,6 +10,7 @@ metadata:
     {{- include "openab.labels" $d | nindent 4 }}
 data:
   config.toml: |
+    {{- if and ($cfg.discord).enabled ($cfg.discord).botToken }}
     [discord]
     bot_token = "${DISCORD_BOT_TOKEN}"
     {{- range $cfg.discord.allowedChannels }}
@@ -40,6 +41,25 @@ data:
     {{- end }}
     {{- if $cfg.discord.trustedBotIds }}
     trusted_bot_ids = {{ $cfg.discord.trustedBotIds | toJson }}
+    {{- end }}
+    {{- end }}
+
+    {{- if and ($cfg.slack).enabled }}
+    [slack]
+    bot_token = "${SLACK_BOT_TOKEN}"
+    app_token = "${SLACK_APP_TOKEN}"
+    {{- range ($cfg.slack).allowedChannels }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "slack.allowedChannels contains a mangled ID: %s — use --set-string instead of --set for channel IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_channels = {{ ($cfg.slack).allowedChannels | default list | toJson }}
+    {{- range ($cfg.slack).allowedUsers }}
+    {{- if regexMatch "e\\+|E\\+" (toString .) }}
+    {{- fail (printf "slack.allowedUsers contains a mangled ID: %s — use --set-string instead of --set for user IDs" (toString .)) }}
+    {{- end }}
+    {{- end }}
+    allowed_users = {{ ($cfg.slack).allowedUsers | default list | toJson }}
     {{- end }}
 
     [agent]

@@ -33,7 +33,8 @@ impl<'de> Deserialize<'de> for AllowBots {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub discord: DiscordConfig,
+    pub discord: Option<DiscordConfig>,
+    pub slack: Option<SlackConfig>,
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -85,6 +86,16 @@ pub struct DiscordConfig {
     /// ignored when `"off"` since all bot messages are rejected before this check.
     #[serde(default)]
     pub trusted_bot_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SlackConfig {
+    pub bot_token: String,
+    pub app_token: String,
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

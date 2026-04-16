@@ -115,6 +115,7 @@ agents:
       - acp
       - --trust-all-tools
     discord:
+      enabled: true      # set to false to disable; enabled with empty botToken is treated as disabled
       botToken: ""
       # ⚠️ Use --set-string for channel IDs to avoid float64 precision loss
       allowedChannels:
@@ -126,6 +127,12 @@ agents:
       allowBotMessages: "off"
       # trustedBotIds: []  # empty = any bot (mode permitting); set to restrict
       trustedBotIds: []
+    slack:
+      enabled: false
+      botToken: ""       # Bot User OAuth Token (xoxb-...)
+      appToken: ""       # App-Level Token (xapp-...) for Socket Mode
+      allowedChannels: []  # empty = allow all channels
+      allowedUsers: []     # empty = allow all users
     workingDir: /home/agent
     env: {}
     envFrom: []

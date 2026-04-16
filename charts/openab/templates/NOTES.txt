@@ -1,15 +1,24 @@
 openab {{ .Chart.AppVersion }} has been installed!
 
-⚠️  Discord channel IDs must be set with --set-string (not --set) to avoid float64 precision loss.
+⚠️  Channel/user IDs must be set with --set-string (not --set) to avoid float64 precision loss.
 
 Agents deployed:
 {{- range $name, $cfg := .Values.agents }}
 {{- if ne (include "openab.agentEnabled" $cfg) "false" }}
   • {{ $name }} ({{ $cfg.command }})
-{{- if not $cfg.discord.botToken }}
+{{- if not (or (and ($cfg.discord).enabled ($cfg.discord).botToken) (and ($cfg.slack).enabled ($cfg.slack).botToken)) }}
     ⚠️  No bot token provided. Create the secret manually:
     kubectl create secret generic {{ include "openab.agentFullname" (dict "ctx" $ "agent" $name) }} \
-      --from-literal=discord-bot-token="YOUR_TOKEN"
+      --from-literal=discord-bot-token="YOUR_DISCORD_TOKEN"
+{{- end }}
+
+{{- if and ($cfg.discord).enabled ($cfg.discord).botToken }}
+    Discord: ✅ configured
+{{- end }}
+{{- if and ($cfg.slack).enabled ($cfg.slack).botToken }}
+    Slack: ✅ configured (Socket Mode)
+    Ensure your Slack app has these bot events: app_mention, message.channels, message.groups
+    Required scopes: app_mentions:read, chat:write, channels:history, groups:history, channels:read, groups:read, reactions:write, files:read
 {{- end }}
 
 {{- if eq $cfg.command "kiro-cli" }}

@@ -1,53 +1,132 @@
-use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{AllowBots, ReactionsConfig, SttConfig};
-use crate::error_display::{format_coded_error, format_user_error};
+use crate::acp::ContentBlock;
+use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::config::{AllowBots, SttConfig};
 use crate::format;
-use crate::reactions::StatusReactionController;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use image::ImageReader;
-use std::io::Cursor;
+use crate::media;
+use async_trait::async_trait;
 use std::sync::LazyLock;
-use serenity::async_trait;
-use serenity::model::channel::{Message, ReactionType};
+use serenity::builder::{CreateThread, EditMessage};
+use serenity::http::Http;
+use serenity::model::channel::{AutoArchiveDuration, Message, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::model::user::User;
 use serenity::prelude::*;
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use std::sync::{Arc, OnceLock};
+use tracing::{debug, error, info};
 
-/// Hard cap on consecutive bot messages (from any other bot) in a
-/// channel or thread. When this many recent messages are all from
-/// bots other than ourselves, we stop responding to prevent runaway
-/// loops between multiple bots in "all" mode.
-///
-/// Note: must be ≤ 255 because Serenity's `GetMessages::limit()` takes `u8`.
-/// Inspired by OpenClaw's `session.agentToAgent.maxPingPongTurns`.
+/// Hard cap on consecutive bot messages in a channel or thread.
+/// Prevents runaway loops between multiple bots in "all" mode.
 const MAX_CONSECUTIVE_BOT_TURNS: u8 = 10;
 
-/// Reusable HTTP client for downloading Discord attachments.
-/// Built once with a 30s timeout and rustls TLS (no native-tls deps).
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("static HTTP client must build")
-});
+// --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
+
+pub struct DiscordAdapter {
+    http: Arc<Http>,
+}
+
+impl DiscordAdapter {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl ChatAdapter for DiscordAdapter {
+    fn platform(&self) -> &'static str {
+        "discord"
+    }
+
+    fn message_limit(&self) -> usize {
+        2000
+    }
+
+    async fn send_message(&self, channel: &ChannelRef, content: &str) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = channel.channel_id.parse()?;
+        let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
+    }
+
+    async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let msg_id: u64 = msg.message_id.parse()?;
+        ChannelId::new(ch_id)
+            .edit_message(
+                &self.http,
+                MessageId::new(msg_id),
+                EditMessage::new().content(content),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn create_thread(
+        &self,
+        channel: &ChannelRef,
+        trigger_msg: &MessageRef,
+        title: &str,
+    ) -> anyhow::Result<ChannelRef> {
+        let ch_id: u64 = channel.channel_id.parse()?;
+        let msg_id: u64 = trigger_msg.message_id.parse()?;
+        let thread = ChannelId::new(ch_id)
+            .create_thread_from_message(
+                &self.http,
+                MessageId::new(msg_id),
+                CreateThread::new(title).auto_archive_duration(AutoArchiveDuration::OneDay),
+            )
+            .await?;
+        Ok(ChannelRef {
+            platform: "discord".into(),
+            channel_id: thread.id.to_string(),
+            thread_id: None,
+            parent_id: Some(channel.channel_id.clone()),
+        })
+    }
+
+    async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let msg_id: u64 = msg.message_id.parse()?;
+        self.http
+            .create_reaction(
+                ChannelId::new(ch_id),
+                MessageId::new(msg_id),
+                &ReactionType::Unicode(emoji.to_string()),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {
+        let ch_id: u64 = msg.channel.channel_id.parse()?;
+        let msg_id: u64 = msg.message_id.parse()?;
+        self.http
+            .delete_reaction_me(
+                ChannelId::new(ch_id),
+                MessageId::new(msg_id),
+                &ReactionType::Unicode(emoji.to_string()),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+// --- Handler: serenity EventHandler that delegates to AdapterRouter ---
 
 pub struct Handler {
-    pub pool: Arc<SessionPool>,
+    pub router: Arc<AdapterRouter>,
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
-    pub reactions_config: ReactionsConfig,
     pub stt_config: SttConfig,
+    pub adapter: OnceLock<Arc<dyn ChatAdapter>>,
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
 }
 
-#[async_trait]
+#[serenity::async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         let bot_id = ctx.cache.current_user().id;
@@ -57,34 +136,27 @@ impl EventHandler for Handler {
             return;
         }
 
+        let adapter = self.adapter.get_or_init(|| {
+            Arc::new(DiscordAdapter::new(ctx.http.clone()))
+        }).clone();
+
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
             self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
 
         let is_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id))
-            || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+            || msg
+                .mention_roles
+                .iter()
+                .any(|r| msg.content.contains(&format!("<@&{}>", r)));
 
-        // Bot message gating — runs after self-ignore but before channel/user
-        // allowlist checks. This ordering is intentional: channel checks below
-        // apply uniformly to both human and bot messages, so a bot mention in
-        // a non-allowed channel is still rejected by the channel check.
+        // Bot message gating (from upstream #321)
         if msg.author.bot {
             match self.allow_bot_messages {
                 AllowBots::Off => return,
                 AllowBots::Mentions => if !is_mentioned { return; },
                 AllowBots::All => {
-                    // Safety net: count consecutive messages from any bot
-                    // (excluding ourselves) in recent history. If all recent
-                    // messages are from other bots, we've likely entered a
-                    // loop. This counts *all* other-bot messages, not just
-                    // one specific bot — so 3 bots taking turns still hits
-                    // the cap (which is intentionally conservative).
-                    //
-                    // Try cache first to avoid an API call on every bot
-                    // message. Fall back to API on cache miss. If both fail,
-                    // reject the message (fail-closed) to avoid unbounded
-                    // loops during Discord API outages.
                     let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
                     let history = ctx.cache.channel_messages(msg.channel_id)
                         .map(|msgs| {
@@ -92,7 +164,7 @@ impl EventHandler for Handler {
                                 .filter(|(mid, _)| **mid < msg.id)
                                 .map(|(_, m)| m.clone())
                                 .collect();
-                            recent.sort_unstable_by(|a, b| b.id.cmp(&a.id)); // newest first
+                            recent.sort_unstable_by(|a, b| b.id.cmp(&a.id));
                             recent.truncate(cap);
                             recent
                         })
@@ -123,7 +195,6 @@ impl EventHandler for Handler {
                 },
             }
 
-            // If trusted_bot_ids is set, only allow bots on the list
             if !self.trusted_bot_ids.is_empty() && !self.trusted_bot_ids.contains(&msg.author.id.get()) {
                 tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
                 return;
@@ -161,9 +232,8 @@ impl EventHandler for Handler {
 
         if !self.allowed_users.is_empty() && !self.allowed_users.contains(&msg.author.id.get()) {
             tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
-            if let Err(e) = msg.react(&ctx.http, ReactionType::Unicode("🚫".into())).await {
-                tracing::warn!(error = %e, "failed to react with 🚫");
-            }
+            let msg_ref = discord_msg_ref(&msg);
+            let _ = adapter.add_reaction(&msg_ref, "🚫").await;
             return;
         }
 
@@ -173,86 +243,80 @@ impl EventHandler for Handler {
             msg.content.trim().to_string()
         };
 
-        // No text and no image attachments → skip to avoid wasting session slots
+        // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
             return;
         }
 
-        // Build content blocks: text + image attachments
-        let mut content_blocks = vec![];
-
-        // Inject structured sender context so the downstream CLI can identify who sent the message
-        let display_name = msg.member.as_ref()
+        let display_name = msg
+            .member
+            .as_ref()
             .and_then(|m| m.nick.as_ref())
             .unwrap_or(&msg.author.name);
-        let sender_ctx = serde_json::json!({
-            "schema": "openab.sender.v1",
-            "sender_id": msg.author.id.to_string(),
-            "sender_name": msg.author.name,
-            "display_name": display_name,
-            "channel": "discord",
-            "channel_id": msg.channel_id.to_string(),
-            "is_bot": msg.author.bot,
-        });
-        let prompt_with_sender = format!(
-            "<sender_context>\n{}\n</sender_context>\n\n{}",
-            serde_json::to_string(&sender_ctx).unwrap(),
-            prompt
-        );
+        let sender = SenderContext {
+            schema: "openab.sender.v1".into(),
+            sender_id: msg.author.id.to_string(),
+            sender_name: msg.author.name.clone(),
+            display_name: display_name.to_string(),
+            channel: "discord".into(),
+            channel_id: msg.channel_id.to_string(),
+            is_bot: msg.author.bot,
+        };
 
-        // Add text block (always, even if empty, we still send for sender context)
-        content_blocks.push(ContentBlock::Text {
-            text: prompt_with_sender.clone(),
-        });
-
-        // Process attachments: route by content type (audio → STT, image → encode)
-        let mut audio_skipped = false;
-        if !msg.attachments.is_empty() {
-            for attachment in &msg.attachments {
-                if is_audio_attachment(attachment) {
-                    if self.stt_config.enabled {
-                        if let Some(transcript) = download_and_transcribe(attachment, &self.stt_config).await {
-                            debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                            content_blocks.insert(0, ContentBlock::Text {
-                                text: format!("[Voice message transcript]: {transcript}"),
-                            });
-                        }
-                    } else {
-                        warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
-                        audio_skipped = true;
+        // Build extra content blocks from attachments (images, audio)
+        let mut extra_blocks = Vec::new();
+        for attachment in &msg.attachments {
+            let mime = attachment.content_type.as_deref().unwrap_or("");
+            if media::is_audio_mime(mime) {
+                if self.stt_config.enabled {
+                    let mime_clean = mime.split(';').next().unwrap_or(mime).trim();
+                    if let Some(transcript) = media::download_and_transcribe(
+                        &attachment.url,
+                        &attachment.filename,
+                        mime_clean,
+                        u64::from(attachment.size),
+                        &self.stt_config,
+                        None,
+                    ).await {
+                        debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
+                        extra_blocks.insert(0, ContentBlock::Text {
+                            text: format!("[Voice message transcript]: {transcript}"),
+                        });
                     }
-                } else if let Some(content_block) = download_and_encode_image(attachment).await {
-                    debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
-                    content_blocks.push(content_block);
+                } else {
+                    tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
+                    let msg_ref = discord_msg_ref(&msg);
+                    let _ = adapter.add_reaction(&msg_ref, "🎤").await;
                 }
-            }
-        }
-
-        // If audio was skipped, react with 🎤 so the user knows their voice message was noticed
-        if audio_skipped {
-            let _ = msg.react(&ctx.http, ReactionType::Unicode("🎤".into())).await;
-            // Voice-only message: no text and only the sender_context block → early return
-            if prompt.is_empty() && content_blocks.len() == 1 {
-                return;
+            } else if let Some(block) = media::download_and_encode_image(
+                &attachment.url,
+                attachment.content_type.as_deref(),
+                &attachment.filename,
+                u64::from(attachment.size),
+                None,
+            ).await {
+                debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
+                extra_blocks.push(block);
             }
         }
 
         tracing::debug!(
-            text_len = prompt_with_sender.len(),
+            num_extra_blocks = extra_blocks.len(),
             num_attachments = msg.attachments.len(),
             in_thread,
             "processing"
         );
 
-        // Note: image-only messages (no text) are intentionally allowed since
-        // prompt_with_sender always includes the non-empty sender_context XML.
-        // The guard above (prompt.is_empty() && no attachments) handles stickers/embeds.
-
-        let thread_id = if in_thread {
-            msg.channel_id.get()
+        let thread_channel = if in_thread {
+            ChannelRef {
+                platform: "discord".into(),
+                channel_id: msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: None,
+            }
         } else {
-            match get_or_create_thread(&ctx, &msg, &prompt).await {
-                Ok(id) => id,
+            match get_or_create_thread(&ctx, &adapter, &msg, &prompt).await {
+                Ok(ch) => ch,
                 Err(e) => {
                     error!("failed to create thread: {e}");
                     return;
@@ -260,68 +324,14 @@ impl EventHandler for Handler {
             }
         };
 
-        let thread_channel = ChannelId::new(thread_id);
+        let trigger_msg = discord_msg_ref(&msg);
 
-        let thinking_msg = match thread_channel.say(&ctx.http, "...").await {
-            Ok(m) => m,
-            Err(e) => {
-                error!("failed to post: {e}");
-                return;
-            }
-        };
-
-        let thread_key = thread_id.to_string();
-        if let Err(e) = self.pool.get_or_create(&thread_key).await {
-            let msg = format_user_error(&e.to_string());
-            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {}", msg)).await;
-            error!("pool error: {e}");
-            return;
-        }
-
-        // Create reaction controller on the user's original message
-        let reactions = Arc::new(StatusReactionController::new(
-            self.reactions_config.enabled,
-            ctx.http.clone(),
-            msg.channel_id,
-            msg.id,
-            self.reactions_config.emojis.clone(),
-            self.reactions_config.timing.clone(),
-        ));
-        reactions.set_queued().await;
-
-        // Stream prompt with live edits (pass content blocks instead of just text)
-        let result = stream_prompt(
-            &self.pool,
-            &thread_key,
-            content_blocks,
-            &ctx,
-            thread_channel,
-            thinking_msg.id,
-            reactions.clone(),
-        )
-        .await;
-
-        match &result {
-            Ok(()) => reactions.set_done().await,
-            Err(_) => reactions.set_error().await,
-        }
-
-        // Hold emoji briefly then clear
-        let hold_ms = if result.is_ok() {
-            self.reactions_config.timing.done_hold_ms
-        } else {
-            self.reactions_config.timing.error_hold_ms
-        };
-        if self.reactions_config.remove_after_reply {
-            let reactions = reactions;
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
-                reactions.clear().await;
-            });
-        }
-
-        if let Err(e) = result {
-            let _ = edit(&ctx, thread_channel, thinking_msg.id, &format!("⚠️ {e}")).await;
+        if let Err(e) = self
+            .router
+            .handle_message(&adapter, &thread_channel, &sender, &prompt, extra_blocks, &trigger_msg)
+            .await
+        {
+            error!("handle_message error: {e}");
         }
     }
 
@@ -330,465 +340,47 @@ impl EventHandler for Handler {
     }
 }
 
-/// Check if an attachment is an audio file (voice messages are typically audio/ogg).
-fn is_audio_attachment(attachment: &serenity::model::channel::Attachment) -> bool {
-    let mime = attachment.content_type.as_deref().unwrap_or("");
-    mime.starts_with("audio/")
+// --- Discord-specific helpers ---
+
+fn discord_msg_ref(msg: &Message) -> MessageRef {
+    MessageRef {
+        channel: ChannelRef {
+            platform: "discord".into(),
+            channel_id: msg.channel_id.get().to_string(),
+            thread_id: None,
+            parent_id: None,
+        },
+        message_id: msg.id.to_string(),
+    }
 }
 
-/// Download an audio attachment and transcribe it via the configured STT provider.
-async fn download_and_transcribe(
-    attachment: &serenity::model::channel::Attachment,
-    stt_config: &SttConfig,
-) -> Option<String> {
-    const MAX_SIZE: u64 = 25 * 1024 * 1024; // 25 MB (Whisper API limit)
-
-    if u64::from(attachment.size) > MAX_SIZE {
-        error!(filename = %attachment.filename, size = attachment.size, "audio exceeds 25MB limit");
-        return None;
-    }
-
-    let resp = HTTP_CLIENT.get(&attachment.url).send().await.ok()?;
-    if !resp.status().is_success() {
-        error!(url = %attachment.url, status = %resp.status(), "audio download failed");
-        return None;
-    }
-    let bytes = resp.bytes().await.ok()?.to_vec();
-
-    let mime_type = attachment.content_type.as_deref().unwrap_or("audio/ogg");
-    let mime_type = mime_type.split(';').next().unwrap_or(mime_type).trim();
-
-    crate::stt::transcribe(&HTTP_CLIENT, stt_config, bytes, attachment.filename.clone(), mime_type).await
-}
-
-/// Maximum dimension (width or height) for resized images.
-/// Matches OpenClaw's DEFAULT_IMAGE_MAX_DIMENSION_PX.
-const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
-
-/// JPEG quality for compressed output (OpenClaw uses progressive 85→35;
-/// we start at 75 which is a good balance of quality vs size).
-const IMAGE_JPEG_QUALITY: u8 = 75;
-
-/// Download a Discord image attachment, resize/compress it, then base64-encode
-/// as an ACP image content block.
-///
-/// Large images are resized so the longest side is at most 1200px and
-/// re-encoded as JPEG at quality 75. This keeps the base64 payload well
-/// under typical JSON-RPC transport limits (~200-400KB after encoding).
-async fn download_and_encode_image(attachment: &serenity::model::channel::Attachment) -> Option<ContentBlock> {
-    const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-
-    let url = &attachment.url;
-    if url.is_empty() {
-        return None;
-    }
-
-    // Determine media type — prefer content-type header, fallback to extension
-    let media_type = attachment
-        .content_type
-        .as_deref()
-        .or_else(|| {
-            attachment
-                .filename
-                .rsplit('.')
-                .next()
-                .and_then(|ext| match ext.to_lowercase().as_str() {
-                    "png" => Some("image/png"),
-                    "jpg" | "jpeg" => Some("image/jpeg"),
-                    "gif" => Some("image/gif"),
-                    "webp" => Some("image/webp"),
-                    _ => None,
-                })
-        });
-
-    let Some(mime) = media_type else {
-        debug!(filename = %attachment.filename, "skipping non-image attachment");
-        return None;
-    };
-    let mime = mime.split(';').next().unwrap_or(mime).trim();
-    if !mime.starts_with("image/") {
-        debug!(filename = %attachment.filename, mime = %mime, "skipping non-image attachment");
-        return None;
-    }
-
-    if u64::from(attachment.size) > MAX_SIZE {
-        error!(filename = %attachment.filename, size = attachment.size, "image exceeds 10MB limit");
-        return None;
-    }
-
-    let response = match HTTP_CLIENT.get(url).send().await {
-        Ok(resp) => resp,
-        Err(e) => { error!(url = %url, error = %e, "download failed"); return None; }
-    };
-    if !response.status().is_success() {
-        error!(url = %url, status = %response.status(), "HTTP error downloading image");
-        return None;
-    }
-    let bytes = match response.bytes().await {
-        Ok(b) => b,
-        Err(e) => { error!(url = %url, error = %e, "read failed"); return None; }
-    };
-
-    // Defense-in-depth: verify actual download size
-    if bytes.len() as u64 > MAX_SIZE {
-        error!(filename = %attachment.filename, size = bytes.len(), "downloaded image exceeds limit");
-        return None;
-    }
-
-    // Resize and compress
-    let (output_bytes, output_mime) = match resize_and_compress(&bytes) {
-        Ok(result) => result,
-        Err(e) => {
-            // Fallback: use original bytes but reject if too large for transport
-            if bytes.len() > 1024 * 1024 {
-                error!(filename = %attachment.filename, error = %e, size = bytes.len(), "resize failed and original too large, skipping");
-                return None;
-            }
-            debug!(filename = %attachment.filename, error = %e, "resize failed, using original");
-            (bytes.to_vec(), mime.to_string())
-        }
-    };
-
-    debug!(
-        filename = %attachment.filename,
-        original_size = bytes.len(),
-        compressed_size = output_bytes.len(),
-        "image processed"
-    );
-
-    let encoded = BASE64.encode(&output_bytes);
-    Some(ContentBlock::Image {
-        media_type: output_mime,
-        data: encoded,
-    })
-}
-
-/// Resize image so longest side ≤ IMAGE_MAX_DIMENSION_PX, then encode as JPEG.
-/// Returns (compressed_bytes, mime_type). GIFs are passed through unchanged
-/// to preserve animation.
-fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
-    let reader = ImageReader::new(Cursor::new(raw))
-        .with_guessed_format()?;
-
-    let format = reader.format();
-
-    // Pass through GIFs unchanged to preserve animation
-    if format == Some(image::ImageFormat::Gif) {
-        return Ok((raw.to_vec(), "image/gif".to_string()));
-    }
-
-    let img = reader.decode()?;
-    let (w, h) = (img.width(), img.height());
-
-    // Resize preserving aspect ratio: scale so longest side = 1200px
-    let img = if w > IMAGE_MAX_DIMENSION_PX || h > IMAGE_MAX_DIMENSION_PX {
-        let max_side = std::cmp::max(w, h);
-        let ratio = f64::from(IMAGE_MAX_DIMENSION_PX) / f64::from(max_side);
-        let new_w = (f64::from(w) * ratio) as u32;
-        let new_h = (f64::from(h) * ratio) as u32;
-        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
-
-    // Encode as JPEG
-    let mut buf = Cursor::new(Vec::new());
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, IMAGE_JPEG_QUALITY);
-    img.write_with_encoder(encoder)?;
-
-    Ok((buf.into_inner(), "image/jpeg".to_string()))
-}
-
-async fn edit(ctx: &Context, ch: ChannelId, msg_id: MessageId, content: &str) -> serenity::Result<Message> {
-    ch.edit_message(&ctx.http, msg_id, serenity::builder::EditMessage::new().content(content)).await
-}
-
-async fn stream_prompt(
-    pool: &SessionPool,
-    thread_key: &str,
-    content_blocks: Vec<ContentBlock>,
+async fn get_or_create_thread(
     ctx: &Context,
-    channel: ChannelId,
-    msg_id: MessageId,
-    reactions: Arc<StatusReactionController>,
-) -> anyhow::Result<()> {
-    let reactions = reactions.clone();
-
-    pool.with_connection(thread_key, |conn| {
-        let content_blocks = content_blocks.clone();
-        let ctx = ctx.clone();
-        let reactions = reactions.clone();
-        Box::pin(async move {
-            let reset = conn.session_reset;
-            conn.session_reset = false;
-
-            let (mut rx, _): (_, _) = conn.session_prompt(content_blocks).await?;
-            reactions.set_thinking().await;
-
-            let initial = if reset {
-                "⚠️ _Session expired, starting fresh..._\n\n...".to_string()
-            } else {
-                "...".to_string()
-            };
-            let (buf_tx, buf_rx) = watch::channel(initial);
-
-            let mut text_buf = String::new();
-            // Tool calls indexed by toolCallId. Vec preserves first-seen
-            // order. We store id + title + state separately so a ToolDone
-            // event that arrives without a refreshed title (claude-agent-acp's
-            // update events don't always re-send the title field) can still
-            // reuse the title we already learned from a prior
-            // tool_call_update — only the icon flips 🔧 → ✅ / ❌. Rendering
-            // happens on the fly in compose_display().
-            let mut tool_lines: Vec<ToolEntry> = Vec::new();
-            let current_msg_id = msg_id;
-
-            if reset {
-                text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
-            }
-
-            // Spawn edit-streaming task — only edits the single message, never sends new ones.
-            // Long content is truncated during streaming; final multi-message split happens after.
-            let edit_handle = {
-                let ctx = ctx.clone();
-                let mut buf_rx = buf_rx.clone();
-                tokio::spawn(async move {
-                    let mut last_content = String::new();
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        if buf_rx.has_changed().unwrap_or(false) {
-                            let content = buf_rx.borrow_and_update().clone();
-                            if content != last_content {
-                                let display = if content.chars().count() > 1900 {
-                                    // Tail-priority: keep the last 1900 chars so the
-                                    // user always sees the most recent agent output
-                                    // (e.g. a confirmation prompt) instead of old tool lines.
-                                    let total = content.chars().count();
-                                    let skip = total - 1900;
-                                    let truncated: String = content.chars().skip(skip).collect();
-                                    format!("…(truncated)\n{truncated}")
-                                } else {
-                                    content.clone()
-                                };
-                                let _ = edit(&ctx, channel, msg_id, &display).await;
-                                last_content = content;
-                            }
-                        }
-                        if buf_rx.has_changed().is_err() {
-                            break;
-                        }
-                    }
-                })
-            };
-
-            // Process ACP notifications
-            let mut got_first_text = false;
-            let mut response_error: Option<String> = None;
-            while let Some(notification) = rx.recv().await {
-                if notification.id.is_some() {
-                    // Capture error from ACP response to display in Discord
-                    if let Some(ref err) = notification.error {
-                        response_error = Some(format_coded_error(err.code, &err.message));
-                    }
-                    break;
-                }
-
-                if let Some(event) = classify_notification(&notification) {
-                    match event {
-                        AcpEvent::Text(t) => {
-                            if !got_first_text {
-                                got_first_text = true;
-                                // Reaction: back to thinking after tools
-                            }
-                            text_buf.push_str(&t);
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
-                        }
-                        AcpEvent::Thinking => {
-                            reactions.set_thinking().await;
-                        }
-                        AcpEvent::ToolStart { id, title } if !title.is_empty() => {
-                            reactions.set_tool(&title).await;
-                            let title = sanitize_title(&title);
-                            // Dedupe by toolCallId: replace if we've already
-                            // seen this id, otherwise append a new entry.
-                            // claude-agent-acp emits a placeholder title
-                            // ("Terminal", "Edit", etc.) on the first event
-                            // and refines it via tool_call_update; without
-                            // dedup the placeholder and refined version
-                            // appear as two separate orphaned lines.
-                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
-                                slot.title = title;
-                                slot.state = ToolState::Running;
-                            } else {
-                                tool_lines.push(ToolEntry {
-                                    id,
-                                    title,
-                                    state: ToolState::Running,
-                                });
-                            }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
-                        }
-                        AcpEvent::ToolDone { id, title, status } => {
-                            reactions.set_thinking().await;
-                            let new_state = if status == "completed" {
-                                ToolState::Completed
-                            } else {
-                                ToolState::Failed
-                            };
-                            // Find by id (the title is unreliable — substring
-                            // match against the placeholder "Terminal" would
-                            // never find the refined entry). Preserve the
-                            // existing title if the Done event omits it.
-                            if let Some(slot) = tool_lines.iter_mut().find(|e| e.id == id) {
-                                if !title.is_empty() {
-                                    slot.title = sanitize_title(&title);
-                                }
-                                slot.state = new_state;
-                            } else if !title.is_empty() {
-                                // Done arrived without a prior Start (rare
-                                // race) — record it so we still show
-                                // something.
-                                tool_lines.push(ToolEntry {
-                                    id,
-                                    title: sanitize_title(&title),
-                                    state: new_state,
-                                });
-                            }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf, true));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            conn.prompt_done().await;
-            drop(buf_tx);
-            let _ = edit_handle.await;
-
-            // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf, false);
-            // If ACP returned both an error and partial text, show both.
-            // This can happen when the agent started producing content before hitting an error
-            // (e.g. context length limit, rate limit mid-stream). Showing both gives users
-            // full context rather than hiding the partial response.
-            let final_content = if final_content.is_empty() {
-                if let Some(err) = response_error {
-                    format!("⚠️ {}", err)
-                } else {
-                    "_(no response)_".to_string()
-                }
-            } else if let Some(err) = response_error {
-                format!("⚠️ {}\n\n{}", err, final_content)
-            } else {
-                final_content
-            };
-
-            let chunks = format::split_message(&final_content, 2000);
-            for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
-                    let _ = edit(&ctx, channel, current_msg_id, chunk).await;
-                } else {
-                    let _ = channel.say(&ctx.http, chunk).await;
-                }
-            }
-
-            Ok(())
-        })
-    })
-    .await
-}
-
-/// Flatten a tool-call title into a single line that's safe to render
-/// inside Discord inline-code spans. Discord renders single-backtick
-/// code on a single line only, so multi-line shell commands (heredocs,
-/// `&&`-chained commands split across lines) appear truncated; we
-/// collapse newlines to ` ; ` and rewrite embedded backticks so they
-/// don't break the wrapping span.
-fn sanitize_title(title: &str) -> String {
-    title.replace('\r', "").replace('\n', " ; ").replace('`', "'")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolState {
-    Running,
-    Completed,
-    Failed,
-}
-
-#[derive(Debug, Clone)]
-struct ToolEntry {
-    id: String,
-    title: String,
-    state: ToolState,
-}
-
-impl ToolEntry {
-    fn render(&self) -> String {
-        let icon = match self.state {
-            ToolState::Running => "🔧",
-            ToolState::Completed => "✅",
-            ToolState::Failed => "❌",
-        };
-        let suffix = if self.state == ToolState::Running { "..." } else { "" };
-        format!("{icon} `{}`{}", self.title, suffix)
-    }
-}
-
-/// Maximum number of finished (or running) tool entries to show individually
-/// during streaming before collapsing into a summary line.
-///
-/// A typical tool line is 40–80 chars (icon + backtick title + suffix).
-/// At 3 lines ≈ 120–240 chars, consuming 6–13 % of the 1900-char Discord
-/// streaming budget, leaving 1660+ chars for agent text.  Beyond 3, tool
-/// titles tend to grow (full shell commands, URLs) so budget consumption
-/// rises non-linearly.  3 is also the practical "glanceable" limit.
-const TOOL_COLLAPSE_THRESHOLD: usize = 3;
-
-fn compose_display(tool_lines: &[ToolEntry], text: &str, streaming: bool) -> String {
-    let mut out = String::new();
-    if !tool_lines.is_empty() {
-        if streaming {
-            let done = tool_lines.iter().filter(|e| e.state == ToolState::Completed).count();
-            let failed = tool_lines.iter().filter(|e| e.state == ToolState::Failed).count();
-            let running: Vec<_> = tool_lines.iter().filter(|e| e.state == ToolState::Running).collect();
-            let finished = done + failed;
-
-            if finished <= TOOL_COLLAPSE_THRESHOLD {
-                for entry in tool_lines.iter().filter(|e| e.state != ToolState::Running) {
-                    out.push_str(&entry.render());
-                    out.push('\n');
-                }
-            } else {
-                let mut parts = Vec::new();
-                if done > 0 { parts.push(format!("✅ {done}")); }
-                if failed > 0 { parts.push(format!("❌ {failed}")); }
-                out.push_str(&format!("{} tool(s) completed\n", parts.join(" · ")));
-            }
-
-            if running.len() <= TOOL_COLLAPSE_THRESHOLD {
-                for entry in &running {
-                    out.push_str(&entry.render());
-                    out.push('\n');
-                }
-            } else {
-                // Parallel running tools exceed threshold — show last N + summary
-                let hidden = running.len() - TOOL_COLLAPSE_THRESHOLD;
-                out.push_str(&format!("🔧 {hidden} more running\n"));
-                for entry in running.iter().skip(hidden) {
-                    out.push_str(&entry.render());
-                    out.push('\n');
-                }
-            }
-        } else {
-            for entry in tool_lines {
-                out.push_str(&entry.render());
-                out.push('\n');
-            }
+    adapter: &Arc<dyn ChatAdapter>,
+    msg: &Message,
+    prompt: &str,
+) -> anyhow::Result<ChannelRef> {
+    let channel = msg.channel_id.to_channel(&ctx.http).await?;
+    if let serenity::model::channel::Channel::Guild(ref gc) = channel {
+        if gc.thread_metadata.is_some() {
+            return Ok(ChannelRef {
+                platform: "discord".into(),
+                channel_id: msg.channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: None,
+            });
         }
-        if !out.is_empty() { out.push('\n'); }
     }
-    out.push_str(text.trim_end());
-    out
+
+    let thread_name = format::shorten_thread_name(prompt);
+    let parent = ChannelRef {
+        platform: "discord".into(),
+        channel_id: msg.channel_id.get().to_string(),
+        thread_id: None,
+        parent_id: None,
+    };
+    let trigger_ref = discord_msg_ref(msg);
+    adapter.create_thread(&parent, &trigger_ref, &thread_name).await
 }
 
 static ROLE_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -818,226 +410,4 @@ fn resolve_mentions(content: &str, bot_id: UserId, mentions: &[User]) -> String 
     let out = ROLE_MENTION_RE.replace_all(&out, "@(role)");
     let out = USER_MENTION_RE.replace_all(&out, "@(user)").to_string();
     out.trim().to_string()
-}
-
-fn shorten_thread_name(prompt: &str) -> String {
-    // Strip @(role) and @(user) placeholders left by resolve_mentions()
-    let cleaned = prompt.replace("@(role)", "").replace("@(user)", "");
-    // Shorten GitHub URLs: https://github.com/owner/repo/issues/123 → owner/repo#123
-    let re = regex::Regex::new(r"https?://github\.com/([^/]+/[^/]+)/(issues|pull)/(\d+)").unwrap();
-    let shortened = re.replace_all(cleaned.trim(), "$1#$3");
-    let name: String = shortened.chars().take(40).collect();
-    if name.len() < shortened.len() {
-        format!("{name}...")
-    } else {
-        name
-    }
-}
-
-async fn get_or_create_thread(ctx: &Context, msg: &Message, prompt: &str) -> anyhow::Result<u64> {
-    let channel = msg.channel_id.to_channel(&ctx.http).await?;
-    if let serenity::model::channel::Channel::Guild(ref gc) = channel {
-        if gc.thread_metadata.is_some() {
-            return Ok(msg.channel_id.get());
-        }
-    }
-
-    let thread_name = shorten_thread_name(prompt);
-
-    let thread = msg
-        .channel_id
-        .create_thread_from_message(
-            &ctx.http,
-            msg.id,
-            serenity::builder::CreateThread::new(thread_name)
-                .auto_archive_duration(serenity::model::channel::AutoArchiveDuration::OneDay),
-        )
-        .await?;
-
-    Ok(thread.id.get())
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_png(width: u32, height: u32) -> Vec<u8> {
-        let img = image::RgbImage::new(width, height);
-        let mut buf = Cursor::new(Vec::new());
-        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
-        buf.into_inner()
-    }
-
-    #[test]
-    fn large_image_resized_to_max_dimension() {
-        let png = make_png(3000, 2000);
-        let (compressed, mime) = resize_and_compress(&png).unwrap();
-
-        assert_eq!(mime, "image/jpeg");
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert!(result.width() <= IMAGE_MAX_DIMENSION_PX);
-        assert!(result.height() <= IMAGE_MAX_DIMENSION_PX);
-    }
-
-    #[test]
-    fn small_image_keeps_original_dimensions() {
-        let png = make_png(800, 600);
-        let (compressed, mime) = resize_and_compress(&png).unwrap();
-
-        assert_eq!(mime, "image/jpeg");
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.width(), 800);
-        assert_eq!(result.height(), 600);
-    }
-
-    #[test]
-    fn landscape_image_respects_aspect_ratio() {
-        let png = make_png(4000, 2000);
-        let (compressed, _) = resize_and_compress(&png).unwrap();
-
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.width(), 1200);
-        assert_eq!(result.height(), 600);
-    }
-
-    #[test]
-    fn portrait_image_respects_aspect_ratio() {
-        let png = make_png(2000, 4000);
-        let (compressed, _) = resize_and_compress(&png).unwrap();
-
-        let result = image::load_from_memory(&compressed).unwrap();
-        assert_eq!(result.width(), 600);
-        assert_eq!(result.height(), 1200);
-    }
-
-    #[test]
-    fn compressed_output_is_smaller_than_original() {
-        let png = make_png(3000, 2000);
-        let (compressed, _) = resize_and_compress(&png).unwrap();
-
-        assert!(compressed.len() < png.len(), "compressed {} should be < original {}", compressed.len(), png.len());
-    }
-
-    #[test]
-    fn gif_passes_through_unchanged() {
-        // Minimal valid GIF89a (1x1 pixel)
-        let gif: Vec<u8> = vec![
-            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
-            0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // logical screen descriptor
-            0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // image descriptor
-            0x02, 0x02, 0x44, 0x01, 0x00, // image data
-            0x3B, // trailer
-        ];
-        let (output, mime) = resize_and_compress(&gif).unwrap();
-
-        assert_eq!(mime, "image/gif");
-        assert_eq!(output, gif);
-    }
-
-    #[test]
-    fn invalid_data_returns_error() {
-        let garbage = vec![0x00, 0x01, 0x02, 0x03];
-        assert!(resize_and_compress(&garbage).is_err());
-    }
-
-    // --- compose_display tests ---
-
-    fn tool(id: &str, title: &str, state: ToolState) -> ToolEntry {
-        ToolEntry { id: id.to_string(), title: title.to_string(), state }
-    }
-
-    #[test]
-    fn compose_display_at_threshold_shows_individual_lines() {
-        let tools = vec![
-            tool("1", "cmd-a", ToolState::Completed),
-            tool("2", "cmd-b", ToolState::Completed),
-            tool("3", "cmd-c", ToolState::Completed),
-        ];
-        let out = compose_display(&tools, "hello", true);
-        assert!(out.contains("✅ `cmd-a`"), "should show individual tool");
-        assert!(out.contains("✅ `cmd-b`"), "should show individual tool");
-        assert!(out.contains("✅ `cmd-c`"), "should show individual tool");
-        assert!(!out.contains("tool(s) completed"), "should not collapse at threshold");
-    }
-
-    #[test]
-    fn compose_display_above_threshold_collapses() {
-        let tools = vec![
-            tool("1", "cmd-a", ToolState::Completed),
-            tool("2", "cmd-b", ToolState::Completed),
-            tool("3", "cmd-c", ToolState::Completed),
-            tool("4", "cmd-d", ToolState::Completed),
-        ];
-        let out = compose_display(&tools, "hello", true);
-        assert!(out.contains("✅ 4 tool(s) completed"), "should collapse above threshold");
-        assert!(!out.contains("`cmd-a`"), "individual tools should be hidden");
-    }
-
-    #[test]
-    fn compose_display_mixed_completed_and_failed() {
-        let tools = vec![
-            tool("1", "ok-1", ToolState::Completed),
-            tool("2", "ok-2", ToolState::Completed),
-            tool("3", "ok-3", ToolState::Completed),
-            tool("4", "fail-1", ToolState::Failed),
-            tool("5", "fail-2", ToolState::Failed),
-        ];
-        let out = compose_display(&tools, "", true);
-        assert!(out.contains("✅ 3 · ❌ 2 tool(s) completed"));
-    }
-
-    #[test]
-    fn compose_display_running_shown_alongside_collapsed() {
-        let tools = vec![
-            tool("1", "done-1", ToolState::Completed),
-            tool("2", "done-2", ToolState::Completed),
-            tool("3", "done-3", ToolState::Completed),
-            tool("4", "done-4", ToolState::Completed),
-            tool("5", "active", ToolState::Running),
-        ];
-        let out = compose_display(&tools, "text", true);
-        assert!(out.contains("✅ 4 tool(s) completed"));
-        assert!(out.contains("🔧 `active`..."));
-        assert!(out.contains("text"));
-    }
-
-    #[test]
-    fn compose_display_parallel_running_guard() {
-        let tools: Vec<_> = (0..5)
-            .map(|i| tool(&i.to_string(), &format!("run-{i}"), ToolState::Running))
-            .collect();
-        let out = compose_display(&tools, "", true);
-        assert!(out.contains("🔧 2 more running"), "should collapse excess running tools");
-        assert!(out.contains("🔧 `run-3`..."), "should show recent running");
-        assert!(out.contains("🔧 `run-4`..."), "should show recent running");
-    }
-
-    #[test]
-    fn compose_display_non_streaming_shows_all() {
-        let tools = vec![
-            tool("1", "cmd-a", ToolState::Completed),
-            tool("2", "cmd-b", ToolState::Completed),
-            tool("3", "cmd-c", ToolState::Completed),
-            tool("4", "cmd-d", ToolState::Completed),
-            tool("5", "cmd-e", ToolState::Failed),
-        ];
-        let out = compose_display(&tools, "final", false);
-        assert!(out.contains("✅ `cmd-a`"));
-        assert!(out.contains("✅ `cmd-d`"));
-        assert!(out.contains("❌ `cmd-e`"));
-        assert!(out.contains("final"));
-        assert!(!out.contains("tool(s) completed"), "non-streaming should not collapse");
-    }
-
-    #[test]
-    fn tail_truncation_preserves_multibyte_chars() {
-        let content = "你好世界🌍abcdefghij";
-        let limit = 10;
-        let total = content.chars().count();
-        let skip = total.saturating_sub(limit);
-        let truncated: String = content.chars().skip(skip).collect();
-        assert_eq!(truncated.chars().count(), limit);
-        assert!(truncated.ends_with("abcdefghij"));
-    }
 }
