@@ -164,7 +164,7 @@ impl EventHandler for Handler {
                                 .filter(|(mid, _)| **mid < msg.id)
                                 .map(|(_, m)| m.clone())
                                 .collect();
-                            recent.sort_unstable_by(|a, b| b.id.cmp(&a.id));
+                            recent.sort_unstable_by_key(|m| std::cmp::Reverse(m.id));
                             recent.truncate(cap);
                             recent
                         })
