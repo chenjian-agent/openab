@@ -29,6 +29,14 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
+# Install AWS CLI v2
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip unzip curl && \
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    ./aws/install && \
+    rm -rf aws awscliv2.zip && \
+    apt-get purge -y python3-pip unzip curl && rm -rf /var/lib/apt/lists/*
+
 RUN useradd -m -s /bin/bash -u 1000 agent
 RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
     chown -R agent:agent /home/agent
