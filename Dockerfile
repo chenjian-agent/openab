@@ -37,6 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     rm -rf aws awscliv2.zip && \
     apt-get purge -y python3-pip unzip curl && rm -rf /var/lib/apt/lists/*
 
+# Ensure AWS CLI is in PATH
+ENV PATH="/usr/local/bin:/usr/local/aws-cli/v2/current/bin:$PATH"
+
 RUN useradd -m -s /bin/bash -u 1000 agent
 RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
     chown -R agent:agent /home/agent
